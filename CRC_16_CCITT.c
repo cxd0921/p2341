@@ -6,7 +6,7 @@
 #include <stdio.h> 
 #include "Update_Driver.h"
 
-// CRC16_CCITT 计算方法一
+// 计算方法一
 unsigned short CRC16_CCITT (unsigned char *pdata, int len)
 {
 	//初始值 
