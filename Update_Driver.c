@@ -19,6 +19,7 @@
 #include <time.h>
 #include <stdarg.h>
 #include "send_log.h"
+#include "spidev-rkslv.h"
 
 #define SPISLAVE_CLR_FIFO	_IOW(SPI_IOC_MAGIC, 5, __u32)
 #define SPISLAVE_SET_SPEED	_IOW(SPI_IOC_MAGIC, 6, __u32)
@@ -42,7 +43,7 @@ unsigned char Right_AckSts;
 unsigned char Error_AckSts;
 int gpio_fd=-1;
 extern int recieve_flag;
-
+unsigned char gpio_flag;
 
 #define IIC0_DEVICE    				"/dev/i2c-2"
 #define IIC_ADDR_940   				0x3C
@@ -58,12 +59,12 @@ uint32_t continuous_err_counter = 0;	//记录是否连续错误
 
 int clean_SPI_buffer(void)
 {
-	// int ret = ioctl(spi_fd,SPISLAVE_CLR_FIFO,&mode);//清空发送和接收的buffer
+// 	int ret = ioctl(spi_fd,SPISLAVE_CLR_FIFO,&mode);//清空发送和接收的buffer
 
-	// if (ret == -1) {
-    //     akst_debug("can't ioctl SPISLAVE_CLR_FIFO");
-	// 	return -1;
-    // }
+// 	if (ret == -1) {
+//         akst_debug("can't ioctl SPISLAVE_CLR_FIFO");
+// 		return -1;
+//     }
 
  return 0;
 }
@@ -110,7 +111,7 @@ int Update_Init_Gpio(void)
     gpio_fd = open(GPIO_0_ADDRESS,O_RDWR);
     if(gpio_fd<=0)
     {
-        akst_debug("open Gpio Error!");
+        akst_debug("open Gpio Error!\n");
         return -1;
     }
     Right_AckSts = 0;
@@ -124,7 +125,6 @@ int Update_Init_Gpio(void)
 void Update_Close_Gpio(void)
 {
     close(gpio_fd);
-
 }
 
 // 数字  GPIO62 GPIO68
@@ -138,7 +138,6 @@ int Right_Gpio_Ack(void)
     char Ack0=0;        
     char Ack1=2;
 
-	
     if(0 == Right_AckSts){
         write(gpio_fd,&Ack1,1);
     }
@@ -307,7 +306,7 @@ int spi_read_frame(int fd, uint16_t r_len, uint8_t *data){
 	while(recieve_flag){
 		clean_SPI_buffer();		
 		len = read(fd, data, r_len);
-		frame_print("receive_data:", data, len);
+		frame_print("read_data:", data, len);
 
 		if (len < 0){
 			perror("read data fail:");
@@ -334,7 +333,7 @@ int spi_read_frame(int fd, uint16_t r_len, uint8_t *data){
 						}
 					}
 				}else{
-					Error_Gpio_Ack();
+					start_gpio_task(0);
 					akst_debug("read err, len ≠ read_len\n");
 					if(err_count < 20)
 						err_count++;
@@ -348,7 +347,7 @@ int spi_read_frame(int fd, uint16_t r_len, uint8_t *data){
 				ack_ret = crcCheck(&data[0],r_len);
 				
 				if(ack_ret){
-					Error_Gpio_Ack();
+					start_gpio_task(0);
 					akst_debug("crc check err\n");
 					if(err_count < 20)
 						err_count++;
@@ -369,17 +368,16 @@ int spi_read_frame(int fd, uint16_t r_len, uint8_t *data){
 
 }
 
-// 读取第一帧
+// 读取第一帧 
 int spi_read_first_frame(int fd, uint16_t r_len, uint8_t *data){
 	int len, ack_ret, first_frame_len = 0;
 	// uint8_t delay_count = 0, max_wait_times = 0;
 	uint8_t temp[10]={0};
-
 	clean_SPI_buffer();	
 	len = read(fd, temp, 3);
 	frame_print("first read 3 byte:", temp, 3);
-	usleep(100);
-	Error_Gpio_Ack();
+	//usleep(100);;
+	start_gpio_task(0); //ERROR GPIO
 	if(len < 0){
 		perror("read first frame len fail:");
 		return -1;	
@@ -411,7 +409,8 @@ int spi_read_first_frame(int fd, uint16_t r_len, uint8_t *data){
 			frame_print("",data,first_frame_len);
 			ret = -1;
 		}else{	
-			frame_print("\nreceive first frame:",data,first_frame_len);	
+			frame_print("\nreceive first frame:",data,first_frame_len);
+			//start_gpio_task(1);	
 			ret = 0;
 		}
 	}
@@ -652,7 +651,7 @@ int log_read_first_frame(int fd, uint16_t r_len, uint8_t *data){
 		}else if(len == 0){
 			continue;
 		}else if(len != r_len){
-			Error_Gpio_Ack();
+			start_gpio_task(0);
 			akst_debug("read err, len ≠ read_len.\n");
 			continue;
 		}else{
@@ -660,7 +659,7 @@ int log_read_first_frame(int fd, uint16_t r_len, uint8_t *data){
 		}
 
 		if(ack_ret){
-			Error_Gpio_Ack();
+			start_gpio_task(0);
 			time_debug("crc check err\n");
 			frame_print("err frame:", data, 10);
 			continue;

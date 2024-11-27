@@ -16,15 +16,18 @@
 #include "CRC_16_CCITT.h"
 #include <pthread.h>
 #include "send_log.h"
+#include "spidev-rkslv.h"
+#include"subscribe.h"
+#include <pthread.h> 
+const char *my_version = "2024.11.26";
 
-//11
-const char *my_version = "2024.08.23";
-
-
-const char *recieve_file = "/userdata/update/m116_update.bin";
-const char *recieve_file_zip = "/userdata/update/m116_update.zip";
+const char*update_file_bin="/userdata/update/update_app.bin";
+const char *recieve_file = "/userdata/update/p2341_update.bin";
+const char *recieve_file_zip = "/userdata/update/p2341_update.zip";
 const char *update_file_path = "/userdata/update/";
 const char *md5_file_path = "/userdata/update/save_md5";
+
+
 static void Update_Process_Task(void);
 static int Update_Init_Task(void);
 static int begin_update(void);
@@ -37,7 +40,7 @@ static int get_pack_num(uint8_t *data, uint32_t *pack_num);
 static int get_total_bytes(uint8_t *data, uint64_t *total_len);
 static int check_recieve_over(uint32_t pack_num, uint64_t data_len);
 static int check_timeout(int len, uint16_t *delay_count, uint16_t *max_wait_times);
-
+int start_mqtt_task();
 static int p_write_task(void *arg);
 static int p_spi_monitor(void *arg);
 static int p_reg_940_monitor(void *arg);
@@ -70,7 +73,6 @@ typedef struct linknode {
     struct linknode* next;
 }LinkNode;
 LinkNode* Header = NULL;
-
 int recieve_flag;
 uint8_t delay_200ms_counter = 0;
 FILE *fp_receive = NULL;
@@ -104,17 +106,19 @@ static void Update_Process_Task(void)
 	int ret = 0;
 	recieve_flag = 0;	
 	ret |= Update_Init_Spi();
-	ret |= Update_Init_Gpio();
+	//ret |= Update_Init_Gpio();
 	ret |= Update_Init_I2C();
 	ret |= Update_Init_940_REG();
 	if(ret){
 		akst_debug("%speripheral init error! spi process quit.%s\n",LEFT_RED,RIGHT);
 		return;
 	}
+	
 	Update_Init_Task();
 
 	while(1){
-    	spi_main(spi_fd);
+    	//start_mqtt_task();
+		spi_main(spi_fd);
 	}
 }
 
@@ -122,7 +126,7 @@ static int Update_Init_Task(void){
 	int ret;
 	pthread_mutex_init(&link_mutex, NULL);
 	set_step_A(0);
-	set_step_B(0);
+	set_step_B(0);	
 
 	pthread_t reg_940_monitor;
     ret = pthread_create(&reg_940_monitor,
@@ -153,19 +157,19 @@ static int Update_Init_Task(void){
 
 	return 0;
 }
+struct slv_ioc_data data;
 
 static int spi_main(int fd)
-{
+{	
 	uint8_t read_buf_2[1024], FN_last = 0xFF, index = 0;
 	uint16_t r_len,delay_count, max_wait_times;
-	uint32_t pack_num = 0,pack_num_last = 1;
+	uint32_t pack_num = 0,pack_num_last = -1;
 	uint16_t data_len = 0;
 	int ack_ret,len = 0, recieve_pack_result = 0;
-	int SN=0;
-	
+	int SN=-1;
 	uint8_t header_buf[6],right_buf[1024];
+
 						
-	
 	if(recieve_flag){
 		clear_Gpio();
 		Right_AckSts = 0;
@@ -174,7 +178,6 @@ static int spi_main(int fd)
 			usleep(2*1000);
 		}
 	}
-
 	#if 1
 	//收取第一条指令
 	int max_read_times = 30; 
@@ -205,6 +208,7 @@ static int spi_main(int fd)
 		return 0;
 	}
 	#endif
+
 	time_debug("get update request.\n");
 	cal_update_time(0);
 	if(initRecieveFile())
@@ -216,7 +220,6 @@ static int spi_main(int fd)
 			if(continuous_err_counter > 2){		//检测连续错误
 				time_debug("continuous err, continuous_err_counter:%d, err_counter:%d\n",continuous_err_counter, err_counter);
 			}
-
 			get_read_len(&index,&r_len);
 			//clean_SPI_buffer();								
 			debug_record_ack();
@@ -229,10 +232,10 @@ static int spi_main(int fd)
 				usleep(820);			//延迟一会再接收下一帧, 避免连续错误
 				continue;	
 			}else if(len != r_len){
+				akst_debug("len != r_len");
 				if(check_timeout(len,&delay_count,&max_wait_times)){
 					recieve_pack_result = 1;
 				}
-				
 				if(recieve_flag)
 					continue;
 				else
@@ -243,74 +246,79 @@ static int spi_main(int fd)
 				if(read_buf_2[0] == 0x55 && read_buf_2[1] == 0xAA){	//有时候驱动出问题校验对, 但是头不对, 所以先判断头	
 					ack_ret = crcCheck(&read_buf_2[0],r_len);
 				}else{
-					//akst_debug("header crc\n");
+					akst_debug("header or crc err\n");
 					//Error_Gpio_Ack();
 					ack_ret = 1;
 				}
 			}
 			
 			if(!recieve_flag)break;
-
 			// akst_debug("%02X %02X %02X\n", read_buf_2[6],read_buf_2[7],read_buf_2[8]);
 			if(!ack_ret)
 			{
 				if((index<7 && FN_last != read_buf_2[5]) || index>=7)
 					index++;
 				if(read_buf_2[3] == 9 && read_buf_2[4] == 0 && read_buf_2[6] == 4)
-					get_total_bytes(read_buf_2,&data_write.total_bytes);
+					get_total_bytes(read_buf_2,&data_write.total_bytes);//[5]
 				if(read_buf_2[3] == 9 && read_buf_2[4] == 1)
-					get_recieve_md5(read_buf_2,r_md5sum);
-
+					get_recieve_md5(read_buf_2,r_md5sum);//[7]
+				
+				if(index<8 &&(SN+1!=read_buf_2[5])){
+					continue;
+				}
 				if(index < 8)
-				{
+				{	SN=read_buf_2[5];
 					FN_last = read_buf_2[5];
 					akst_debug("[%d]",index);
-				 	frame_print("",read_buf_2,read_buf_2[2]+3);
-				 }else{
-				 	get_pack_num(read_buf_2,&pack_num);		
+					frame_print("",read_buf_2,read_buf_2[2]+3);
+					start_gpio_task(1);
+
+				}else{
+					get_pack_num(read_buf_2,&pack_num);		
 				}
-			
-				if(index==11)//2024.09.10 接收到重复的数据
+
+				if(index==11)//2024.09.10 重复接收数据帧
 				{
-					if(SN!=read_buf_2[5])
-						SN=read_buf_2[5];
-					if(pack_num==pack_num_last&&SN==read_buf_2[5])
+					if(pack_num==pack_num_last){
+						//akst_debug("pack_num err\n");
 						continue;
-					// akst_debug("[%d]", index);
-					// frame_print("", read_buf_2, 512);
-					// akst_debug("\n");
+					}
 				}
-			
 				//akst_debug("pack_num_last:%d pack_num:%d\n", pack_num_last,pack_num);
-				if(index == 11 && pack_num !=pack_num_last)
-				{
-					get_valid_len(read_buf_2,&data_len);
+				if(index == 11 && pack_num!=pack_num_last)
+				{	
+					get_valid_len(read_buf_2,&data_len);//498
 					data_write.revieve_bytes += data_len;
 					Add_Node(read_buf_2);
+					data.length=512;
+					memcpy(data.data,read_buf_2,512);
+					// akst_debug("[%d]", index);
+					// frame_print("",data.data, 512);
+					// akst_debug("\n");
+					if(ioctl(fd, SPI_IOC_UPDATE_BUFFER, &data) < 0) {
+							perror("SPI_IOC_UPDATE_BUFFER ioctl failed");
+							usleep(100*1000);
+							continue;
+					}else {
+						usleep(1*1000);
+					}
 					recieve_pack_result = check_recieve_over(pack_num, data_len);
 					if(recieve_pack_result)	
 						break;
 					pack_num_last = pack_num;
-				}	
-				//2024.09.15 数据连续出现错误,时序有问题
+				}
+				//2024.09.15 接收数据连续出现错误,异常退出,时序出错
 				for(int i=0;i<6;++i)
 				{
 					header_buf[i]=read_buf_2[i];
 				}	
-				//memcpy(header_buf,read_buf_2,6);
 				header_buf[5]=read_buf_2[5]+1;
-				Right_Gpio_Ack();
+				//Right_Gpio_Ack();
 			}else{
 				int ret=find_right_data(header_buf,read_buf_2,right_buf);
 				if(ret==0)
-				{	
-					//frame_print("right_buf:", right_buf, 512);
-					//if(right_buf[0]== 0x55 && right_buf[1]==0xaa){	
-						ack_ret = crcCheck(right_buf,r_len);
-					// }else{
-					// 	akst_debug("header err\n");
-					// 	ack_ret=1;
-					//}
+				{		
+					ack_ret = crcCheck(right_buf,r_len);
 					if(!ack_ret)
 					{	
 						header_buf[5]=right_buf[5]+1;
@@ -318,16 +326,23 @@ static int spi_main(int fd)
 						//akst_debug("#pack_num_last:%d pack_num:%d #\n", pack_num_last,pack_num);	
 							if(pack_num!=pack_num_last)
 							{	
-								//frame_print("right_buf:", right_buf, 512);
-								//akst_debug("\n");
+								frame_print("right_buf:", right_buf, 512);
+								akst_debug("\n");
 								get_valid_len(right_buf,&data_len);
 								data_write.revieve_bytes += data_len;
 								Add_Node(right_buf);
+
+								data.length=512;
+								memcpy(data.data,right_buf,512);
+								if(ioctl(fd, SPI_IOC_UPDATE_BUFFER, &data) < 0) {
+									perror("SPI_IOC_UPDATE_BUFFER ioctl failed");
+									usleep(10*1000);
+									continue;
+								}
 								recieve_pack_result = check_recieve_over(pack_num, data_len);
 								if(recieve_pack_result)	
 									break;
 								pack_num_last = pack_num;
-								Right_Gpio_Ack();
 							}else{
 								akst_debug("Same packum\n");
 								continue;
@@ -335,11 +350,13 @@ static int spi_main(int fd)
 							}
 					}else{
 						akst_debug("Crc check error\n");
-						Error_Gpio_Ack();					
+						continue;
+						//Error_Gpio_Ack();					
 					}
 				}else{
 					akst_debug("Data  error\n");
-					Error_Gpio_Ack();
+					continue;
+					//Error_Gpio_Ack();
 				}
 			}
 		}
@@ -358,16 +375,18 @@ static int spi_main(int fd)
 	if(0 == check_pack_ret){
 		// time_debug("%scheck md5sum ok.%s\n\n",LEFT_GREEN,RIGHT);
 		time_debug("receive pack ok.\n\n");	
-		//write_0x18_1_byte(PACK_EXIST);
+		//recieve_flag = 1;
+		write_0x18_1_byte(PACK_EXIST);
+
 	}else{
 		time_debug("\nreceive pack failed.\n\n");
-		system("rm -r /userdata/update/m116_update.zip");
+		system("rm -r /userdata/update/p2341_update.zip");
 		system("sync");
 		//write_0x18_1_byte(PACK_NOT_EXIST);		//2024.01.17 升级包状态改为收到请求之后再上报
 	}
 	
 	//clear_Gpio();
-	//recieve_flag = 0;		//传输完毕, 退出流程, 等待发起升级请求			
+	//recieve_flag = 0;	//传输完毕, 退出流程, 等待发起升级请求				
 	return 0;
 
 }
@@ -444,10 +463,10 @@ int find_match(char *haystack, char *needle, int haystack_len, int needle_len) {
 static int initRecieveFile(void)
 {
 	system("mkdir -p /userdata/update");
-	// system("rm -r /data/update/m116_update.bin");
-	system("rm -r /userdata/update/m116_update.zip");	
+	// system("rm -r /data/update/p2341_update.bin");
+	system("rm -r /userdata/update/p2341_update.zip");	
 	if ((fp_receive = fopen(recieve_file, "wb")) == NULL) {
-		perror("Can not create file: /userdata/update/m116_update.bin\n");
+		perror("Can not create file: /userdata/update/p2341_update.bin\n");
 		return -1;
 	}
 	system("sync");
@@ -517,7 +536,7 @@ static int get_pack_num(uint8_t *data, uint32_t *pack_num){
 	return 0;	
 }
 
-// 获取1包中的有效长度
+// 获取1包中的有效长度 数据长度
 static int get_valid_len(uint8_t *data, uint16_t *len){
 	*len = data[10]; 
 	*len <<= 8; 
@@ -544,7 +563,8 @@ static int check_timeout(int len, uint16_t *delay_count, uint16_t *max_wait_time
 	if(len){					//传输中，len不对，spi驱动错误timeout
 		*delay_count = 0;
 		*max_wait_times = 0;	
-		Error_Gpio_Ack();
+		//Error_Gpio_Ack();
+		start_gpio_task(0);
 		usleep(820);			//延迟一会再接收下一帧, 避免连续错误
 		return 0;	
 	}else{						//传输中，len=0,表示没收到，等待一会后超时
@@ -581,7 +601,8 @@ static int check_recieve_over(uint32_t pack_num, uint64_t data_len){
 	int ret = 0;
 	int r_counter = 0;
 	if((pack_num+1)*498 - data_write.revieve_bytes != 0 && data_len == 498){
-		 Error_Gpio_Ack();
+		 //Error_Gpio_Ack();
+		 start_gpio_task(0);
 		 akst_debug("%s\n\nlose 1 pack, receive err, quit.%s\n\n",LEFT_RED,RIGHT);
 		 akst_debug("pack_num:%d\nreceive_bytes:%ld\n",pack_num,data_write.revieve_bytes);
 		for(r_counter = 0;r_counter < 5;r_counter++){
@@ -594,7 +615,7 @@ static int check_recieve_over(uint32_t pack_num, uint64_t data_len){
 		akst_debug("\n");
 		time_debug("receive over!\n");
 		akst_debug("last_len:%ld, receive_bytes:%ld, total_bytes:%ld\n",data_len,data_write.revieve_bytes,data_write.total_bytes);//2023.11.20测试发现异常结束
-		Right_Gpio_Ack();
+		start_gpio_task(1);
 		while(!data_write.write_over && wait_over_counter--){
 			usleep(1000);
 		}
@@ -610,28 +631,40 @@ static int check_recieve_over(uint32_t pack_num, uint64_t data_len){
 	if(1 == ret){
 		fclose(fp_receive);	
 		system("sync");
-		system("rm -r /userdata/update/m116_update.bin");
+		system("rm -r /userdata/update/p2341_update.bin");
 		system("sync");
 	}
 	if(2 == ret){
 		fclose(fp_receive);
 		system("sync");
-		system("mv /userdata/update/m116_update.bin /userdata/update/m116_update.zip");
+		system("mv /userdata/update/p2341_update.bin /userdata/update/p2341_update.zip");
 		system("sync");
 	}
 
 	return ret;
 }
 
+pthread_t mqtt_thread1;
+int start_mqtt_task()
+{
+	if (pthread_create(&mqtt_thread1, NULL, mqtt_sub_task, NULL) != 0) {
+		akst_debug("Failed to create gpio task \n");
+		return -1;
+	}
+	return 0;
+}
+
 // 开始升级
 static int begin_update(void){
+
 	char save_md5[50] = {0};
-	Right_Gpio_Ack();
+	start_gpio_task(1);
 	time_debug("receive begin update flag.\n");
 	if(read_md5_file(save_md5)){
 		write_0x18_1_byte(UPDATE_FAILED);	
 		return -1;
 	}
+	
 	write_0x18_1_byte(BEGIN_UPDATE);
 	getMD5sum(recieve_file_zip,cal_md5sum);
 	akst_debug("cal_md5:%s len:%ld\n",cal_md5sum,strlen(cal_md5sum));
@@ -644,7 +677,7 @@ static int begin_update(void){
 		write_0x18_1_byte(UPDATE_FAILED);		
 		return -1;
 	}
-
+	
 	char cmd_temp[100];
 	akst_debug("begin update.\n");
 	system("echo emmc_disable_all_wp > /proc/mmc_debug"); //先解除写保护 
@@ -653,15 +686,21 @@ static int begin_update(void){
 	usleep(20*1000);						 	
 
 	sprintf(cmd_temp,"unzip  -o -q %s -d  %s",recieve_file_zip,update_file_path);
-	akst_debug("%s\n",cmd_temp);//unzip -o -q /userdata/update/m116_update.zip -d  /userdata/update/
+	akst_debug("%s\n",cmd_temp);//unzip -o -q /userdata/update/p2341_update.zip -d  /userdata/update/
 	system(cmd_temp);
-	system("rm -r /userdata/update/m116_update.zip");		 
-	
-	system("mv -f /userdata/update/upgrade.bin /usr/bin/upgrade.bin");
-	system("chmod +x /usr/bin/upgrade.bin");
+	system("rm -r /userdata/update/p2341_update.zip");		 
+	system("chmod +x /userdata/update/update_app.bin");
 	system("sync");
-	system("/usr/bin/upgrade.bin");   
-	return 0;
+
+	start_mqtt_task();
+
+	if(system("/userdata/update/update_app.bin")){
+		akst_debug("shell execute failed\n");
+		write_0x18_1_byte(UPDATE_FAILED);
+		return -1;
+	}
+
+    return 0;
 }
 
 
@@ -671,6 +710,7 @@ static int p_reg_940_monitor(void *arg){
 	uint8_t err_count = 0;
 
 	while(1){	
+		//usleep(100*1000);
 		usleep(100*1000);
 		int ret = i2c_read_940_btye();
 		if(ret){
@@ -698,7 +738,7 @@ static int set_step_B(int step){
 	return 0;
 }
 
-// 写入文件的线程
+//读取链表数据,写入bin文件
 static int p_write_task(void *arg){
 	while(1){
 		if(data_write.node_counter){
@@ -777,7 +817,7 @@ static int Add_Node(uint8_t *new_data) {
     return 0;
 }
 
-// 读取节点线程
+// 读取节点线程,写入bin文件
 static int Read_Node(void) {
 	uint16_t data_len = 0;
 	uint32_t pack_num = 0;
@@ -792,7 +832,7 @@ static int Read_Node(void) {
 		get_pack_num(current->data,&pack_num);
 
 		set_step_B(2);
-		fwrite(&current->data[12], data_len, 1, fp_receive);//写入updata.bin
+		fwrite(&current->data[12], data_len, 1, fp_receive);//data写入updata.bin 498
 		set_step_B(3);	
 		data_write.write_bytes += data_len;
 
@@ -868,13 +908,14 @@ static int check_pack_exist(void){
 
 	time_debug("receive check update flag.\n");
 
-	if(!akst_isFileExist("/userdata/update/m116_update.zip")){
+	if(!akst_isFileExist("/userdata/update/p2341_update.zip")){
 		write_0x18_1_byte(PACK_EXIST);
 	}else{
 		write_0x18_1_byte(PACK_NOT_EXIST);	
 	}
 
-	Right_Gpio_Ack();
+	//Right_Gpio_Ack();
+	start_gpio_task(1);
 
 	return 0;
 }

@@ -7,8 +7,10 @@
 #include "CRC_16_CCITT.h"
 #include <string.h>
 #include <stdlib.h>
-#include "change_slot.h"
 #include<pthread.h>
+#include "spidev-rkslv.h"
+#include "send_log.h"
+#include <linux/ioctl.h>
 
 static const char *log_file_path = "/userdata/alog.7z";
 static const char *log_file_name = "alog.7z";
@@ -25,10 +27,10 @@ static void fill_first_frame(uint32_t log_size, uint8_t *log_first_frame);
 static void fill_pack_frame(uint8_t SN_num, uint32_t pack_num, int bytes_Read,uint8_t *data, uint8_t *rd_log);
 static void fill_empty_frame(uint8_t SN_num, uint32_t pack_num,uint8_t *data);
 
-
-
 extern int recieve_flag;
 extern int spi_fd;
+extern unsigned char gpio_flag;
+int result;
 
 //wkl add
 /**
@@ -39,44 +41,57 @@ extern int spi_fd;
 void* gpio_right_task() {
     
     // 延时操作
-    usleep(30*1000); //延时30ms
+   	usleep(10*1000); //延时30ms
 	//akst_debug("do right ack\n");
-	Right_Gpio_Ack();
+	// Right_Gpio_Ack();
+		gpio_flag = ResponseRightGpio;
+	if (ioctl(spi_fd, SPI_IOC_WRITE_GPIO, &gpio_flag) < 0) {
+				perror("SPI_IOC_WRITE_GPIO ioctl failed");
+				close(spi_fd);
+				return -1;
+	}
 
     return NULL;
 }
 void* gpio_error_task() {
     
     // 延时操作
-    usleep(30*1000); //延时30ms
+   	usleep(10*1000); //延时30ms
 	//akst_debug("do right ack\n");
-	Error_Gpio_Ack();
+	//Error_Gpio_Ack();
+	gpio_flag = ResponseWrongGpio;
+	if (ioctl(spi_fd, SPI_IOC_WRITE_GPIO, &gpio_flag) < 0) {
+				perror("SPI_IOC_WRITE_GPIO ioctl failed");
+				close(spi_fd);
+				return -1;
+	}
 
     return NULL;
 }
+
 /**
  * @description:  起一个操作gpio的ack的任务
  * @param {void*} arg
  * @return {*} -1 failed 0 success
  */
-pthread_t thread;
+
+pthread_t thread1,thread2;
 int start_gpio_task(int bool)
 {
-	
 	// 创建线程
 	if(bool){
-			if (pthread_create(&thread, NULL, gpio_right_task, NULL) != 0) {
+			if (pthread_create(&thread1, NULL, gpio_right_task, NULL) != 0) {
 				akst_debug("Failed to create gpio task \n");
 				return -1;
 			}else {
-				akst_debug("Right_Gpio_Ack\n");
+				//akst_debug("Right_Gpio_Ack\n");
 			}
 	}else {
-		    if (pthread_create(&thread, NULL, gpio_error_task, NULL) != 0) {
-        	akst_debug("Failed to create gpio task \n");
-        	return -1;
+		    if (pthread_create(&thread2, NULL, gpio_error_task, NULL) != 0) {
+        		akst_debug("Failed to create gpio task \n");
+        		return -1;
     		}else {
-				//akst_debug("Error_Gpio_Ack\n");
+				akst_debug("Error_Gpio_Ack\n");
 			}
 	}
 
@@ -84,13 +99,14 @@ int start_gpio_task(int bool)
 }
 
 int spi_send_log(void){
-	uint8_t read_buf_2[10], read_buf[256], rd_log_buff[498], send_buffer[512], SN_num ,persent, persent_last = 0;;
+	uint8_t read_buf_2[10], read_buf[256], rd_log_buff[498], send_buffer[512], SN_num ,persent, persent_last = 0;
 	int  ret, bytes_Read;
 	uint32_t log_size, pack_num,err_num=0, send_size = 0; 
-	uint8_t log_first_frame[first_frame_len], last_empty_frame = 0;
-
+	uint8_t log_first_frame[first_frame_len], last_empty_frame = 0,send_last_buffer[512];
+	memset(send_last_buffer,0,512);
 	time_debug("get send log request.\n");
 	start_gpio_task(1); 
+		
 	write_0x18_1_byte(BEGIN_PACK_LOG);	
 
 	ret = init_log_files(&log_size);
@@ -112,14 +128,14 @@ int spi_send_log(void){
 	//发送第一帧log文件信息
 	fill_first_frame(log_size,log_first_frame);
 	frame_print("send first frame log msg:",log_first_frame,first_frame_len);
-	write_0x18_1_byte(LOG_PACK_OK);	
+	write_0x18_1_byte(LOG_PACK_OK);
+
 	for(int wait_ok_counter = 0; wait_ok_counter < 3; wait_ok_counter++){
 		time_debug("log:first write [%d] \n", wait_ok_counter);
 		get_time_stamp();
-		//start_gpio_task(1);
 		write(spi_fd, log_first_frame, first_frame_len);
-		usleep(10*1000);
 		ret = log_read_first_frame(spi_fd,10,read_buf_2);
+		//start_gpio_task(1); 
 		if(ret){
 			system("rm -r /userdata/alog.7z");
 			return -1;
@@ -134,66 +150,63 @@ int spi_send_log(void){
 			break;	
 		}
 	}
-
 	akst_debug("begin send log data.\n");
 	SN_num = 2;
 	pack_num = 1;
 	akst_debug("log_size:%d\n",log_size);
+	struct slv_ioc_data data;
 	while (((bytes_Read = fread(rd_log_buff, sizeof(unsigned char), sizeof(rd_log_buff), file)) > 0 || last_empty_frame)  && recieve_flag) {
-		fill_pack_frame(SN_num, pack_num, bytes_Read, send_buffer, rd_log_buff);
+		fill_pack_frame(SN_num, pack_num, bytes_Read, data.data, rd_log_buff);
 		akst_debug("\nSN:%d\t",SN_num);
-		akst_debug("bytes_Read:%d\n",bytes_Read);
+		//akst_debug("bytes_Read:%d\n",bytes_Read);
+		//memcpy(data.data,send_buffer,512);
+		frame_print("send_buffer:",data.data,bytes_Read+14);
+		data.length=512;
 		if(last_empty_frame){
 			akst_debug("send empty frame.\n");
 			fill_empty_frame(SN_num, pack_num,send_buffer);	
 		}
 		while(recieve_flag){
-			//clean_SPI_buffer();
-			//get_time_stamp();
-
-			start_gpio_task(1);
-			if(bytes_Read!=498){
-				akst_debug("last frame1\n");
+			if(ioctl(spi_fd, SPI_IOC_SEND_LOG, &data) < 0) {
+				perror("SPI_IOC_SEND_LOG ioctl failed");
+				usleep(100*1000);
+				continue;
+			}else {
+				akst_debug("send_over\n");
+				break;
 			}
-			ret=write(spi_fd, send_buffer, 512);
-
-			if(!ret){
-				frame_print("send_buf:",send_buffer,bytes_Read+14);
-			}
-			if(bytes_Read!=498){
-				akst_debug("last frame2\n");
-			}
-
-			//usleep(50*1000);
+			/*********************
+			clean_SPI_buffer();
+			get_time_stamp();
+			//start_gpio_task(1);
+			write(spi_fd, send_buffer, 512);
+			usleep(50*1000);
+			
 			if(spi_read_frame(spi_fd,10,read_buf)){
 				recieve_flag = 0;
 				akst_debug("spi_read_frame err\n");
 				break;
 			}
-			if(bytes_Read!=498){
-				akst_debug("last frame3\n");
-			}
-			if(read_buf[6] == SN_num&&read_buf[5]==read_buf[6]){
+			if(read_buf[6] == SN_num){
 				if(read_buf[7] == 0){
-					if(1 == last_empty_frame){
+					if(1 == last_empty_frame)
 						last_empty_frame = 0;
-					}
-					break;
+					break;	
 				}else{
-					err_num++;
+					//start_gpio_task(0);
+					err_num++;	
 					continue;	
 				}
 			}else{
+				//start_gpio_task(0);
 				continue;
-			}
-			
+				}
+				*********************/
 		}
-
 		send_size += bytes_Read;
 		persent =  (uint8_t)((uint64_t)send_size*100/log_size);
 		if(persent != persent_last){
 			akst_debug("send_percent[%d%%],err_num[%d]\n",persent,err_num);
-			
 		}
 		akst_debug("send_size:%d\n",send_size);
 		if(send_size== log_size&& bytes_Read == 498){
@@ -201,7 +214,6 @@ int spi_send_log(void){
 			akst_debug("last_empty_frame:%d",last_empty_frame);
 			akst_debug("last frame 498, need send 1 empty frame. %s┌( `_ゝ` )┐%s\n",LEFT_RED,RIGHT);
 		}
-		
 		persent_last = persent;
 		SN_num++;
 		pack_num++;

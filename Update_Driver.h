@@ -4,7 +4,7 @@
  * @LastEditors: weikunlong kunlong.wei@tongdajs.com
  * @LastEditTime: 2024-08-14 10:09:58
  * @FilePath: \spi_trans\spi\Update_Driver.h
- * @Description: 默认设置,请设置`customMade`, 打开koroFileHeader查看配置 进行设置: https://github.com/OBKoro1/koro1FileHeader/wiki/%E9%85%8D%E7%BD%AE
+ * @Description: 这是默认设置,请设置`customMade`, 打开koroFileHeader查看配置 进行设置: https://github.com/OBKoro1/koro1FileHeader/wiki/%E9%85%8D%E7%BD%AE
  */
 
 #ifndef _UPDATE_DRIVER_H
@@ -15,15 +15,16 @@
 
 #define akst_debug(fmt, ...) \
     do {\
-        fprintf(stderr, fmt, ##__VA_ARGS__);\
+        fprintf(stderr,fmt,##__VA_ARGS__);\
     } while(0)
-
 
 #define CLEAR_REG					0X00
 #define PACK_EXIST					0X4E
 #define PACK_NOT_EXIST				0X4F
 #define BEGIN_UPDATE				0XA1
+
 #define UPDATE_FAILED				0X99
+#define UPDATE_SUCCESS				0X66
 
 #define BUF_MAX_SIZE	(512/4)
 
